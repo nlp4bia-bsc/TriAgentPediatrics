@@ -1,0 +1,13 @@
+*.pyc
+.vscode/*
+*.ipynb
+*.txt
+
+specialties/gastro/*
+batch_logs/*
+*.sh
+guidance_test.py
+results/*
+inf_models/*
+mock_scripts/*
+data/*
