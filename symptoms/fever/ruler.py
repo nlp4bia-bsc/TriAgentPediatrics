@@ -55,16 +55,16 @@ class FeverRuler(SpecialtyRuler[FeverModel]):
         # Age-based rules
         age_months = self.patient_ctx.age_months
         
-        if age_months is not None and age_months < 24:
+        if age_months is not None and age_months <= 24:
             if duration is not None and duration > 1:
                 return self.format_result(
                     TriageLevel.PRIMARY_CARE_TODAY,
-                    "fever in child < 2 yrs for more than one day"
+                    "fever in child (3-24 months) for more than one day"
                 )
             if duration is not None and duration <= 1:
                 return self.format_result(
                     TriageLevel.PRIMARY_CARE_APPOINTMENT,
-                    "fever in child < 2 yrs for one day or less"
+                    "fever in child (3-24 months) for one day or less"
                 )
         
         if age_months is not None and age_months >= 24:

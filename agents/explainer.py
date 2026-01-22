@@ -4,12 +4,12 @@ Generates human-readable explanations of triage decisions.
 Includes formatting methods for all result models.
 """
 
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Tuple
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.outlines import OutlinesModel
 from pydantic_ai.settings import ModelSettings
-from enum import Enum
+import asyncio
 
 from core.models import (
     TriageLevel,
@@ -44,7 +44,20 @@ Professional, analytical, and concise. Use clinical terminology (e.g., "hemodyna
 - Lifecycle Summary (The 'path' of the patient through the agents).
 - Specialty Breakdown (Highlighting the "handshake" between rules and LLM).
 - Conflict Resolution (Why one specialty took precedence over another).
-- Audit Warnings (Gaps in guidelines or data)."""
+- Audit Warnings (Gaps in guidelines or data).
+
+### OUTPUT FORMAT (STRICT)
+Lifecycle Summary:
+<text>
+
+Specialty Breakdown:
+<text>
+
+Conflict Resolution:
+<text>
+
+Audit Warnings:
+<text>"""
 
 
 EXPLAINER_PATIENT_FAMILY_PROMPT = """### ROLE
@@ -65,8 +78,25 @@ Warm, empathetic, and jargon-free. Avoid mentioning "LLMs," "Agents," or "Rule-E
 - Why this decision was made (Linking their concerns to the outcome).
 - Reassurance (What we checked for and ruled out).
 - Safety Net (When to ignore this advice and go to the ER).
-"""
 
+### OUTPUT FORMAT (STRICT)
+Plan:
+<text>
+
+Decision Justification:
+<text>
+
+Reassurance:
+<text>
+
+Safety Net:
+<text>"""
+
+
+PROMPT_CONFIG = {
+    AudienceType.MEDICAL_STAFF: EXPLAINER_MEDICAL_STAFF_PROMPT,
+    AudienceType.PATIENT_FAMILY: EXPLAINER_PATIENT_FAMILY_PROMPT,
+}
 
 from rich.console import Console
 from rich.panel import Panel
@@ -227,32 +257,80 @@ class TriageExplainer:
     """
     
     def __init__(self, out_model: OutlinesModel):
-        # ... your existing init for medical_explainer and patient_explainer ...
-        self.medical_explainer = Agent(
-            model=out_model,
-            system_prompt=EXPLAINER_MEDICAL_STAFF_PROMPT,
-        )
-
-        self.patient_explainer = Agent(
-            model=out_model,
-            system_prompt=EXPLAINER_PATIENT_FAMILY_PROMPT,
-        )
+        # Initialize explanation agents for each audience type that has a prompt
+        self.explainer_agents = {
+            audience_type: Agent(
+                model=out_model,
+                system_prompt=prompt + "\n\nYou must not reveal chain-of-thought or internal reasoning.",
+            )
+            for audience_type, prompt in PROMPT_CONFIG.items()
+        }
         # Initialize the visualizer for debugging
         self.viz = TriageVisualizer()
 
-    async def explain_for_debugging(
+    async def explain(
+        self,
+        patient_ctx: PatientContext,
+        safety_assessment: SafetyAssessment,
+        final_decision: FinalTriageDecision,
+        audience: Optional[List[AudienceType]],
+        routing_decision: Optional[RoutingDecision] = None,
+        specialty_results: Optional[Dict[SpecialtyType, Dict[str, Any]]] = None
+    ) -> Dict[AudienceType, str]:
+        
+        # Packaging arguments for internal helpers
+        context_data = {
+            'patient_ctx': patient_ctx,
+            'safety_assessment': safety_assessment,
+            'final_decision': final_decision,
+            'routing_decision': routing_decision,
+            'specialty_results': specialty_results
+        }
+
+        # 1. Trigger Visualization (Handled as sync unless it involves network IO)
+        self.create_visualization(**context_data)
+
+        base_explanation = {audience_type: 'No explanation requested' for audience_type in AudienceType}
+        if not audience:
+            return base_explanation
+        
+        prompt = self._build_explanation_prompt(**context_data)
+
+        async with asyncio.TaskGroup() as tg:
+            # Create a dedicated task for each specialty
+            tasks = {
+                audience_type: tg.create_task(
+                    self.explainer_agents[audience_type].run(
+                        user_prompt=prompt,
+                        model_settings=ModelSettings(extra_body={'max_new_tokens': 400})
+                    )
+                )
+                for audience_type in audience if audience_type in self.explainer_agents
+            }
+
+        explanations = {
+            audience_type: task.result().output
+            for audience_type, task in tasks.items()
+        }
+
+        unimplemented_audiences = set(audience) - set(explanations.keys())
+        for aud in unimplemented_audiences:
+            explanations[aud] = 'No explanation available for this audience type.'
+        
+        return base_explanation | explanations 
+
+    def create_visualization(
         self,
         patient_ctx: PatientContext,
         safety_assessment: SafetyAssessment,
         final_decision: FinalTriageDecision,
         routing_decision: Optional[RoutingDecision] = None,
         specialty_results: Optional[Dict[SpecialtyType, Dict[str, Any]]] = None,
-    ) -> str:
+    ) -> None:
         """
         Renders a beautiful terminal dashboard and returns the raw 
         string for logging purposes.
         """
-        # 1. TRIGGER THE VISUAL DASHBOARD
         # We wrap this in a try-block to ensure debugging never crashes the main flow
         try:
             self.viz.render_all(
@@ -264,99 +342,48 @@ class TriageExplainer:
             )
         except Exception as e:
             print(f"Visualization Error: {e}")
-
-        # 2. RETURN THE RAW STRING (For file logs/backups)
-        return self._build_explanation_prompt(
-            patient_ctx, final_decision,
-            safety_assessment, routing_decision, specialty_results
-        )
-    
-
-    async def explain(
-        self,
-        patient_ctx: PatientContext,
-        final_decision: FinalTriageDecision,
-        audience: AudienceType,
-        safety_assessment: Optional[SafetyAssessment] = None,
-        routing_decision: Optional[RoutingDecision] = None,
-        specialty_results: Optional[Dict[SpecialtyType, Dict[str, Any]]] = None
-    ) -> str:
-        """
-        Generate explanation of triage decision for specified audience.
-       
-        Args:
-            patient_ctx: Original patient context
-            final_decision: Final triage decision from aggregator
-            routing_decision: Optional routing results
-            specialty_results: Optional individual specialty results (extraction, rb triage and validation)
-            audience: Target audience for explanation
-       
-        Returns:
-            TriageExplanation tailored to the audience
-        """
-        # Select appropriate agent
-        agent = (
-            self.medical_explainer
-            if audience == AudienceType.MEDICAL_STAFF
-            else self.patient_explainer
-        )
-       
-        # Build comprehensive prompt
-        prompt = self._build_explanation_prompt(
-            patient_ctx, final_decision,
-            safety_assessment, routing_decision, specialty_results
-        )
-    
-       
-        # Generate explanation
-        result = await agent.run(
-            prompt,
-            model_settings=ModelSettings(extra_body={'max_new_tokens': 800})
-        )
-       
-        return result.output
    
-    def _build_explanation_prompt(
-        self,
-        patient_ctx: PatientContext,
-        final_decision: FinalTriageDecision,
-        safety_assessment: Optional[SafetyAssessment],
-        routing_decision: Optional[RoutingDecision],
-        specialty_results: Optional[Dict[SpecialtyType, Dict[str, Any]]]
-    ) -> str:
-        """Build comprehensive prompt for explanation generation."""
+    def _build_explanation_prompt(self, **kwargs) -> str:
+        """Helper to construct the prompt from keyword arguments."""
+        # Using .get() to safely handle optional arguments
+        patient_ctx = kwargs.get('patient_ctx')
+        safety = kwargs.get('safety_assessment')
+        routing = kwargs.get('routing_decision')
+        specialties = kwargs.get('specialty_results')
+        final = kwargs.get('final_decision')
+
         prompt_parts = [
             "Generate a comprehensive triage explanation based on the following information:\n",
             "\n### PATIENT CASE",
-            patient_ctx._patient_summary,
+            patient_ctx._patient_summary if patient_ctx else "N/A",
         ]
-       
-        # Add safety assessment if available
-        if safety_assessment:
-            prompt_parts.append("\n### SAFETY ASSESSMENT")
-            prompt_parts.append(safety_assessment.format_for_explanation())
-       
-        # Add routing if available
-        if routing_decision:
-            prompt_parts.append("\n### ROUTING")
-            prompt_parts.append(routing_decision.format_for_explanation())
-       
+        
+        if safety:
+            prompt_parts.append(f"\n### SAFETY ASSESSMENT\n{safety.format_for_explanation()}")
+        
+        if routing:
+            prompt_parts.append(f"\n### ROUTING\n{routing.format_for_explanation()}")
 
-        if specialty_results:
+        if specialties:
             prompt_parts.append("\n### SPECIALTY EVALUATIONS")
-            for specialty, specialty_result in specialty_results.items():
-                prompt_parts.append(f"{specialty.value} extraction and triage:")
-                prompt_parts.append(specialty_result['triage'].format_for_explanation())
-                prompt_parts.append(specialty_result['validation'].format_for_explanation())
-       
-        # Add final decision (always present)
-        prompt_parts.append("\n### FINAL DECISION")
-        prompt_parts.append(final_decision.format_for_explanation())
-       
-        prompt_parts.append("\n### TASK")
-        prompt_parts.append(
-            "Based on all the information above, generate a clear, "
-            "comprehensive explanation of the triage decision."
-        )
-       
+            for spec, res in specialties.items():
+                prompt_parts.append(f"**{spec.value}**:")
+                # Safe access to dict keys
+                if 'triage' in res:
+                    prompt_parts.append(res['triage'].format_for_explanation())
+                if 'validation' in res:
+                    prompt_parts.append(res['validation'].format_for_explanation())
+        
+        if final:
+            prompt_parts.append(f"\n### FINAL DECISION\n{final.format_for_explanation()}")
+        
+        prompt_parts.append("\n### TASK\nGenerate a clear, comprehensive explanation tailored to the context.")
+
+        prompt_parts += [
+            "\n### IMPORTANT:",
+            "Do NOT include your reasoning process.",
+            "Do NOT describe how you are constructing the answer.",
+            "Output ONLY the final structured explanation."
+
+        ]
         return "\n".join(prompt_parts)
