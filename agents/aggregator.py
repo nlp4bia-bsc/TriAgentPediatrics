@@ -30,15 +30,14 @@ Given validated results from multiple medical specialties and the triage guideli
 ## Aggregation Principles
 
 ### Safety-First Hierarchy
-- URGENT > MODERATE > MILD
-- If ANY specialty suggests URGENT, strongly consider URGENT unless clearly invalid
+- EMERCENCY DEPARTMENT > PRIMARY CARE TODAY > PRIMARY CARE DEPARTMENT
 - Exception: Invalid urgency escalations should be corrected
 
 ### Conflict Resolution Strategies
 
-**Urgency Mismatch** (e.g., Fever says URGENT, Neurological says MILD):
+**Urgency Mismatch** (e.g., Fever says EMERCENCY DEPARTMENT, Neurological says PRIMARY CARE DEPARTMENT):
 - Identify which specialty is driving urgency
-- Check if urgent specialty's reasoning is valid; if so, prioritize it
+- Check if most urgent specialty's reasoning is valid; if so, prioritize it
 
 **Contradictory Findings** (e.g., "fever present" vs "no fever"):
 - This indicates data extraction error or ambiguous case

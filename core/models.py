@@ -47,6 +47,7 @@ class TriageLevel(str, Enum):
     PRIMARY_CARE_APPOINTMENT = "primary_care_appointment"
     PRIMARY_CARE_TODAY = "primary_care_today"
     EMERGENCY_DEPARTMENT = "emergency_department"
+    UNMATCHED = "unmatched"
 
 # Safety Checker
 class RedFlagCategory(str, Enum):
@@ -55,10 +56,10 @@ class RedFlagCategory(str, Enum):
     CIRCULATION = "circulation"
     CONSCIOUSNESS = "consciousness"
     SEVERE_PAIN = "severe_pain"
+    PSYCHOLOGICAL = "psychological"
     TRAUMA = "trauma"
     CARDIAC = "cardiac"
     NEUROLOGICAL = "neurological"
-    SEPSIS = "sepsis"
     HEMORRHAGE = "hemorrhage"
 
 
@@ -199,92 +200,46 @@ class ValidationAction(str, Enum):
 class SpecialtyValidation(BaseModel):
     """Validation result for a single specialty triage."""
     extraction_status: ExtractionStatus
+    extraction_reasoning: str = Field(
+        description="Explanation of why the extraction is correct or incorrect, focusing on the most 'controversial' attributes"
+    )
+
     validation_action: ValidationAction
     validated_level: TriageLevel = Field(
         description="Suggested triage level if escalation or de-escalation is needed"
     )
     validation_reasoning: str = Field(
-        description="Explanation of why the rule-based result is invialid"
+        description="Explanation of why the rule-based result is valid "
     )
 
     def format_for_explanation(self) -> str:
         """Format specialty validation for explanation/debugging."""
         lines = [f"## EXTRACTION VALIDATION"]
         lines.append(f"  Extraction Status: {self.extraction_status}")
+        lines.append(f"  Extraction Reasoning: {self.extraction_reasoning}")
         lines.append(f"  Validation Action: {self.validation_action}")
         lines.append(f"  Validated Level: {self.validated_level}")
         lines.append(f"  Validation Reasoning: {self.validation_reasoning}")
         return "\n".join(lines)
 
-
-class ConflictType(str, Enum):
-    """Types of conflicts between specialty results."""
-    URGENCY_MISMATCH = "urgency_mismatch"  # Different urgency levels
-    OVERLAPPING_SYMPTOMS = "overlapping_symptoms"  # Same symptom, different interpretation
-
-class ConflictResolution(BaseModel):
-    """Resolution of conflicts between multiple specialties."""
-    conflict_type: ConflictType
-    description: str = Field(
-        description="What is the conflict and why does it matter"
-    )
-    resolution_strategy: str = Field(
-        description="How the conflict should be resolved"
-    )
-    final_level: TriageLevel = Field(
-        description="The triage level after resolving this conflict"
-    )
-
-    def format_for_explanation(self) -> str:
-        """Format conflict resolution for explanation/debugging."""
-        lines = [f"## CONFLICT: {self.conflict_type.value}"]
-        lines.append(f"Description: {self.description}")
-        lines.append(f"Resolution Strategy: {self.resolution_strategy}")
-        lines.append(f"Final Level: {self.final_level.value}")
-        
-        return "\n".join(lines)
-
-
-
 class FinalTriageDecision(BaseModel):
-    """Final aggregated triage decision with full reasoning chain."""
+    """The authoritative output of the Aggregator."""
     final_level: TriageLevel
+    safety_protocol_used: str = Field(description="Which deterministic rule forced this decision (e.g. 'Max-Urgency-Override')")
+    rationale_summary: str = Field(description="A concise summary of why this level was chosen")
     
-    # Conflict information
-    conflicts_detected: List[ConflictResolution]
+    # Reliability Metrics
+    clinical_coherence_score: float = Field(description="0.0 to 1.0 score of how well symptoms fit together")
+    coherence_explanation: str = Field(description="Explanation of the coherence score")
     
-    # Decision rationale
-    reasoning: str = Field(
-        description="Main clinical reasoning for the final triage level"
-    )
-
-    # Flags for human review
-    requires_human_review: bool = Field(
-        description="Whether this case should be reviewed by a human"
-    )
-    review_reasons: List[str] = Field(
-        default_factory=list,
-        description="Specific reasons why human review is needed"
-    )
+    # Audit Flags
+    requires_human_review: bool
+    review_triggers: List[str] = Field(default_factory=list)
+    guideline_gap_detected: bool
+    guideline_gaps: List[str] = Field(default_factory=list)
     
-    # Edge case detection
-    falls_outside_guidelines: bool = Field(
-        description="Whether this case appears to fall outside guideline coverage"
-    )
-    guideline_gaps: List[str] = Field(
-        default_factory=list,
-        description="Specific aspects of the case not covered by guidelines"
-    )
-    
-    # Clinical coherence
-    clinical_coherence_score: float = Field(
-        ge=0.0, le=1.0,
-        description="0-1 score of how clinically coherent the overall assessment is"
-    )
-    coherence_notes: str = Field(
-        description="Explanation of clinical coherence assessment"
-    )
-
+    # Conflict Resolution
+    conflict_resolution_notes: str = Field(description="How disagreements between specialties were handled")
 
     def format_for_explanation(self) -> str:
         """Format final triage decision for explanation/debugging."""
@@ -292,48 +247,47 @@ class FinalTriageDecision(BaseModel):
         lines.append("FINAL TRIAGE DECISION")
         lines.append("=" * 70)
         lines.append(f"\nFinal Level: {self.final_level.value}")
-        lines.append(f"Primary Reasoning: {self.reasoning}")
+        lines.append(f"Safety Protocol Used: {self.safety_protocol_used}")
+        lines.append(f"Primary Reasoning: {self.rationale_summary}")
         
         lines.append(f"\n### Quality Indicators")
         lines.append(f"Clinical Coherence Score: {self.clinical_coherence_score:.2f}")
-        lines.append(f"Coherence Notes: {self.coherence_notes}")
+        lines.append(f"Coherence Notes: {self.coherence_explanation}")
         lines.append(f"Requires Human Review: {self.requires_human_review}")
         
-        if self.review_reasons:
+        if self.review_triggers:
             lines.append(f"Review Reasons:")
-            for reason in self.review_reasons:
+            for reason in self.review_triggers:
                 lines.append(f"  - {reason}")
         
-        lines.append(f"Falls Outside Guidelines: {self.falls_outside_guidelines}")
-        if self.guideline_gaps:
+        lines.append(f"Falls Outside Guidelines: {self.guideline_gap_detected}")
+        if self.guideline_gap_detected:
             lines.append(f"Guideline Gaps:")
             for gap in self.guideline_gaps:
                 lines.append(f"  - {gap}")
         
-        if self.conflicts_detected:
-            lines.append(f"\n### Conflicts Detected and Resolved")
-            for conflict in self.conflicts_detected:
-                lines.append(f"\n{conflict.format_for_explanation()}")
+        if self.conflict_resolution_notes:
+            lines.append(f"\n### Conflicts Detected and Resolved:\n{self.conflict_resolution_notes}")
         
         return "\n".join(lines)
     
     @classmethod
     def escalation_case(cls, safety_res: SafetyAssessment) -> FinalTriageDecision:
+    
         return cls(
-            final_level=TriageLevel.URGENT,
-            reasoning=safety_res.reasoning,
+            final_level=TriageLevel.EMERGENCY_DEPARTMENT,
+            safety_protocol_used='none',
+            rationale_summary=safety_res.reasoning,
+            clinical_coherence_score=1.0,
+            coherence_explanation="Escalation case automatically set to EMERGENCY DEPARTMENT by safety checker.",
             requires_human_review=True,
-            review_reasons=[
+            review_triggers=[
                 "Immediate escalation flagged by safety checker due to detected red flags."
             ],
-            conflicts_detected=[],
-            falls_outside_guidelines=False,
+            guideline_gap_detected=False,
             guideline_gaps=[],
-            clinical_coherence_score=1.0,
-            coherence_notes="Escalation case automatically set to Urgent by safety checker.",
+            conflict_resolution_notes='Not done'
         )
-
-
 
 class AudienceType(str, Enum):
     """Target audience for the explanation."""
@@ -342,58 +296,58 @@ class AudienceType(str, Enum):
     ADMINISTRATIVE = "administrative"  # Admin staff - concise, procedural
 
 
-class TriageExplanation(BaseModel):
-    """Human-readable explanation of triage decision."""
-    summary: str = Field(
-        description="One-sentence summary of the triage decision"
-    )
+# class TriageExplanation(BaseModel):
+#     """Human-readable explanation of triage decision."""
+#     summary: str = Field(
+#         description="One-sentence summary of the triage decision"
+#     )
     
-    detailed_explanation: str = Field(
-        description="Comprehensive explanation of the decision-making process"
-    )
+#     detailed_explanation: str = Field(
+#         description="Comprehensive explanation of the decision-making process"
+#     )
     
-    key_findings: list[str] = Field(
-        description="Bullet points of critical findings that drove the decision"
-    )
+#     key_findings: list[str] = Field(
+#         description="Bullet points of critical findings that drove the decision"
+#     )
     
-    next_steps: str = Field(
-        description="What happens next for this patient based on triage level"
-    )
+#     next_steps: str = Field(
+#         description="What happens next for this patient based on triage level"
+#     )
     
-    clinical_context: Optional[str] = Field(
-        default=None,
-        description="Additional clinical context or educational information (for medical staff)"
-    )
+#     clinical_context: Optional[str] = Field(
+#         default=None,
+#         description="Additional clinical context or educational information (for medical staff)"
+#     )
     
-    warnings_or_alerts: list[str] = Field(
-        default_factory=list,
-        description="Important warnings or alerts for the care team"
-    )
+#     warnings_or_alerts: list[str] = Field(
+#         default_factory=list,
+#         description="Important warnings or alerts for the care team"
+#     )
 
-    def format_for_explanation(self) -> str:
-        """Format triage explanation for debugging."""
-        lines = ["## TRIAGE EXPLANATION"]
-        lines.append(f"Summary: {self.summary}\n")
+#     def format_for_explanation(self) -> str:
+#         """Format triage explanation for debugging."""
+#         lines = ["## TRIAGE EXPLANATION"]
+#         lines.append(f"Summary: {self.summary}\n")
         
-        lines.append("Detailed Explanation:")
-        lines.append(self.detailed_explanation + "\n")
+#         lines.append("Detailed Explanation:")
+#         lines.append(self.detailed_explanation + "\n")
         
-        lines.append("Key Findings:")
-        for finding in self.key_findings:
-            lines.append(f"  - {finding}")
+#         lines.append("Key Findings:")
+#         for finding in self.key_findings:
+#             lines.append(f"  - {finding}")
         
-        lines.append(f"\nNext Steps: {self.next_steps}\n")
+#         lines.append(f"\nNext Steps: {self.next_steps}\n")
         
-        if self.clinical_context:
-            lines.append("Clinical Context:")
-            lines.append(self.clinical_context + "\n")
+#         if self.clinical_context:
+#             lines.append("Clinical Context:")
+#             lines.append(self.clinical_context + "\n")
         
-        if self.warnings_or_alerts:
-            lines.append("Warnings or Alerts:")
-            for alert in self.warnings_or_alerts:
-                lines.append(f"  - {alert}")
+#         if self.warnings_or_alerts:
+#             lines.append("Warnings or Alerts:")
+#             for alert in self.warnings_or_alerts:
+#                 lines.append(f"  - {alert}")
         
-        return "\n".join(lines)
+#         return "\n".join(lines)
     
 
 # class FinalTriageResult(BaseModel):

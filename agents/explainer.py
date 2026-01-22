@@ -4,294 +4,325 @@ Generates human-readable explanations of triage decisions.
 Includes formatting methods for all result models.
 """
 
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.outlines import OutlinesModel
 from pydantic_ai.settings import ModelSettings
 from enum import Enum
 
-from agents.aggregator import TriageAggregator
 from core.models import (
-    PatientContext, 
+    TriageLevel,
+    SpecialtyType,
+    ValidationAction,
+    ExtractionStatus,
+    PatientContext,
     SafetyAssessment,
     RoutingDecision,
-    SpecialtyType,
     SpecialtyTriageResult,
-    FinalTriageDecision,
     SpecialtyValidation,
-    AudienceType, 
-    TriageExplanation
+    FinalTriageDecision,
+    AudienceType
 )
 
-# from safety_checker import SafetyAssessment, RedFlagCategory
-# from routing.router import RoutingDecision, SpecialtyType
-# from specialty_evaluator import SpecialtyTriageResult, RBTriageResult, TriageLevel
-# from triage_aggregator import (
-#     SpecialtyValidation, 
-#     ConflictResolution, 
-#     FinalTriageDecision,
-#     ValidationStatus,
-#     ConflictType
-# )
 
-EXPLAINER_MEDICAL_STAFF_PROMPT = """You are a medical triage explanation system for healthcare professionals.
 
-## Your Task
-Generate clear, clinically accurate explanations of triage decisions for doctors and nurses.
+EXPLAINER_MEDICAL_STAFF_PROMPT = """### ROLE
+You are a Senior Clinical Systems Auditor. Your task is to provide a technical post-mortem of a multi-agent triage decision for a medical professional.
 
-## Tone and Style
-- **Clinical but Clear**: Use medical terminology appropriately
-- **Evidence-Based**: Reference guidelines and clinical reasoning
-- **Transparent**: Explain the decision-making process step-by-step
-- **Educational**: Provide context on why certain findings matter
+### OBJECTIVE
+Explain the "Lifecycle of the Decision." You must highlight:
+1. THE SAFETY GATE: Why the case did or did not trigger immediate emergency protocols.
+2. AGENT DISCREPANCIES: Explicitly identify where the Rule-Based Extraction and the LLM Validation disagreed (e.g., if a rule failed but the LLM 'saved' the triage).
+3. CLINICAL COHERENCE: Analyze why the system assigned the specific Coherence Score.
+4. AGGREGATION LOGIC: Explain how the final level was derived from multiple specialty inputs (e.g., "Max-Urgency-Override").
 
-## Explanation Structure
+### TONE
+Professional, analytical, and concise. Use clinical terminology (e.g., "hemodynamic stability," "pathognomonic findings").
 
-### Summary (1 sentence)
-Concise statement of final triage level and primary reason.
-Example: "Patient triaged as URGENT due to fever in infant under 3 months of age."
+### STRUCTURE
+- Lifecycle Summary (The 'path' of the patient through the agents).
+- Specialty Breakdown (Highlighting the "handshake" between rules and LLM).
+- Conflict Resolution (Why one specialty took precedence over another).
+- Audit Warnings (Gaps in guidelines or data)."""
 
-### Detailed Explanation (2-3 paragraphs)
-1. **Patient Presentation**: Summarize key clinical findings
-2. **Guideline Application**: Which guidelines were applied and how
-3. **Decision Rationale**: Why this triage level was assigned
-4. **Validation Notes**: Any edge cases, conflicts, or special considerations
 
-### Key Findings (Bullet Points)
-List the critical clinical findings that drove the decision:
-- Use medical terminology
-- Include relevant vital signs, durations, severity indicators
-- Highlight red flags or protective factors
+EXPLAINER_PATIENT_FAMILY_PROMPT = """### ROLE
+You are a Compassionate Pediatric Triage Coordinator. Your task is to explain a triage decision to a worried parent or guardian.
 
-### Next Steps
-What should happen next based on this triage level:
-- URGENT: Immediate physician evaluation, monitoring, diagnostic workup
-- MODERATE: Evaluation within [timeframe], specific assessments needed
-- MILD: Routine evaluation, home care instructions, follow-up criteria
+### OBJECTIVE
+Translate complex multi-agent logic into a reassuring and clear plan of action.
+1. THE "WHY": Explain the final triage level based on the symptoms they reported.
+2. REASSURANCE: Mention the safety checks performed (without using technical terms like "Safety Agent").
+3. THE SPECIALISTS: Explain that several "expert perspectives" (Specialties) were consulted to ensure a thorough review.
+4. NEXT STEPS: Clearly state what they need to do now and what "Red Flags" to watch for at home.
 
-### Clinical Context (Optional)
-Additional medical context:
-- Relevant pathophysiology
-- Differential diagnosis considerations
-- Guideline rationale
-- Quality assurance notes (e.g., AI validation results)
+### TONE
+Warm, empathetic, and jargon-free. Avoid mentioning "LLMs," "Agents," or "Rule-Engines." Use "Our system" or "Our clinical review."
 
-### Warnings/Alerts
-Flag important considerations:
-- Cases requiring human review
-- Guideline gaps or edge cases
-- Conflicting findings that need attention
-- Follow-up monitoring requirements
-
-## Examples
-
-Example 1: Infant Fever (URGENT)
-Summary: "2-month-old infant triaged as URGENT due to fever meeting high-risk criteria."
-
-Detailed: "This 2-month-old presents with fever of 39°C for 6 hours. Per pediatric fever guidelines, any infant under 3 months with documented fever requires urgent evaluation due to increased risk of serious bacterial infection (SBI), including bacteremia and meningitis. The validation process confirmed appropriate guideline application with high clinical coherence. No sepsis signs were identified on initial assessment, but age alone necessitates urgent workup."
-
-Key Findings:
-- Age: 2 months (high-risk age group)
-- Temperature: 39.0°C (confirmed fever)
-- Duration: 6 hours
-- No sepsis signs identified (lethargy, poor perfusion, rash)
-- No immunosuppression noted
-
-Next Steps: "Immediate physician evaluation required. Recommend sepsis workup including CBC, blood culture, urinalysis/culture, and consider lumbar puncture per AAP guidelines. Close monitoring of vital signs and clinical status. Empiric antibiotics may be indicated pending culture results."
-
-Warnings: None - straightforward guideline-directed case.
-
-Example 2: Multi-Specialty with Conflict (MODERATE → URGENT)
-Summary: "4-year-old triaged as URGENT due to combination of fever and respiratory distress overriding initial moderate classifications."
-
-Detailed: "Initial specialty-based triage yielded conflicting levels: fever specialty recommended MODERATE (4-day fever in child >2 years), while respiratory specialty recommended URGENT (significant respiratory distress). Aggregation analysis identified this as an urgency mismatch requiring resolution. Per safety-first principles and given the presence of objective respiratory distress, the case was escalated to URGENT. Validation confirmed both specialty assessments were individually appropriate, but combination warranted higher acuity."
-
-Key Findings:
-- Fever: 4 days duration in 4-year-old
-- Respiratory distress: Tachypnea, retractions noted
-- Specialty conflict: Fever (MODERATE) vs Respiratory (URGENT)
-- Resolution: Escalated to URGENT based on respiratory findings
-
-Next Steps: "Immediate evaluation focusing on respiratory status. Consider chest X-ray, oxygen saturation monitoring, and assessment for pneumonia or other lower respiratory tract infection. Monitor for progression of respiratory distress."
-
-Clinical Context: "The presence of respiratory distress with prolonged fever raises concern for pneumonia or other serious respiratory infection. While fever duration alone would warrant moderate urgency, the respiratory component necessitates immediate assessment to prevent clinical deterioration."
-
-Warnings: 
-- Case demonstrates importance of multi-specialty evaluation
-- Single-specialty triage would have underestimated urgency
+### STRICTURE
+- The Plan (Where to go and when).
+- Why this decision was made (Linking their concerns to the outcome).
+- Reassurance (What we checked for and ruled out).
+- Safety Net (When to ignore this advice and go to the ER).
 """
 
 
-EXPLAINER_PATIENT_FAMILY_PROMPT = """You are a medical triage explanation system for patients and their families.
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.tree import Tree
+from rich.columns import Columns
+from rich.progress import BarColumn, Progress, TextColumn
+from rich.text import Text
+from rich.box import ROUNDED, HEAVY
 
-## Your Task
-Generate compassionate, understandable explanations of triage decisions for non-medical audiences.
+class TriageVisualizer:
+    def __init__(self):
+        self.console = Console()
+        
+    def _get_level_style(self, level: TriageLevel) -> str:
+        mapping = {
+            TriageLevel.EMERGENCY_DEPARTMENT: "bold white on red",
+            TriageLevel.PRIMARY_CARE_TODAY: "bold black on orange1",
+            TriageLevel.PRIMARY_CARE_APPOINTMENT: "bold black on yellow",
+            TriageLevel.UNMATCHED: "dim white",
+        }
+        return mapping.get(level, "white")
 
-## Tone and Style
-- **Empathetic and Reassuring**: Acknowledge concerns and provide comfort
-- **Clear and Simple**: Avoid medical jargon; explain necessary terms
-- **Honest but Gentle**: Be truthful about urgency without causing alarm
-- **Action-Oriented**: Focus on what happens next
+    def _get_action_icon(self, action: ValidationAction) -> str:
+        if action == ValidationAction.APPROVE: return "✅"
+        if action == ValidationAction.ASSIGN: return "🚧"
+        if action == ValidationAction.ESCALATE: return "⬆️"
+        return "❓"
 
-## Explanation Structure
+    def render_header(self, patient: PatientContext):
+        grid = Table.grid(expand=True)
+        grid.add_column(justify="left", ratio=3)
+        grid.add_column(justify="right", ratio=1)
+        
+        summary_text = Text()
+        summary_text.append(f"Patient: ", style="bold cyan")
+        summary_text.append(f"{patient.age_str} | {patient.sex}\n")
+        summary_text.append(f"Complaint: ", style="bold cyan")
+        summary_text.append(f"{patient.reason_for_consultation}", style="white")
+        
+        meta_text = Text()
+        if patient.is_neonate:
+            meta_text.append(" 👶 NEONATE ", style="bold white on magenta")
+        
+        grid.add_row(summary_text, meta_text)
+        
+        self.console.print(Panel(grid, title="🏥 PATIENT CONTEXT", border_style="cyan", box=ROUNDED))
 
-### Summary (1 sentence)
-Simple statement of what will happen next.
-Example: "Your baby needs to be seen by a doctor right away."
+    def render_safety(self, assessment: SafetyAssessment):
+        if assessment.requires_immediate_escalation:
+            style, title, border = "bold white on red", "🚨 IMMEDIATE ESCALATION REQUIRED 🚨", "red"
+        else:
+            style, title, border = "green", "✅ Safety Check Passed", "green"
 
-### Detailed Explanation (2-3 paragraphs)
-1. **What We Found**: Describe symptoms in plain language
-2. **Why It Matters**: Explain why these symptoms need attention (this level)
-3. **What This Means**: Reassure and provide context
+        content = Text()
+        content.append("Red Flags: ", style="bold")
+        if assessment.detected_red_flags:
+            content.append(", ".join(assessment.detected_red_flags), style="bold red")
+        else:
+            content.append("None", style="dim")
+        
+        content.append(f"\n\nReasoning: {assessment.reasoning}", style="italic")
+        self.console.print(Panel(content, title=title, border_style=border, box=ROUNDED))
 
-### Key Findings (Bullet Points)
-List important points in simple language:
-- Use everyday terms
-- Explain what findings mean
-- Focus on actionable information
+    def render_routing(self, decision: RoutingDecision):
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(justify="left", style="bold cyan")
+        table.add_column(justify="left")
+        spec_tags = [f"[reverse] {s.value.upper()} [/]" for s in decision.specialties]
+        table.add_row("Destinations:", " ".join(spec_tags))
+        table.add_row("Reasoning:", f"[dim]{decision.reasoning}[/dim]")
+        self.console.print(Panel(table, title="🔀 Step 2: Specialty Routing", border_style="cyan", box=ROUNDED))
 
-### Next Steps
-Clear explanation of what will happen:
-- Where to go / who will see them
-- What to expect during evaluation
-- Approximate timeframes
-- How to prepare
+    def render_specialty_swimlanes(self, specialty_results: Dict[SpecialtyType, Dict[str, Any]]):
+        panels = []
+        for specialty, result_dict in specialty_results.items():
+            triage_res: SpecialtyTriageResult = result_dict['triage']
+            val_res: SpecialtyValidation = result_dict['validation']
 
-### Warnings/Alerts (If Needed)
-Important things to watch for:
-- Warning signs to return immediately
-- Things to avoid
-- When to call for help
+            spec_tree = Tree(f"[bold]{specialty.value.upper()}[/bold]")
 
-## Language Guidelines
-- "Fever" not "pyrexia"
-- "Low blood pressure" not "hypotension"  
-- "Breathing difficulty" not "respiratory distress"
-- "Infection in the blood" not "bacteremia"
+            # Rule Branch
+            rule_node = spec_tree.add("🤖 [bold]Rule Engine[/]")
+            if triage_res.extraction_success:
+                rule_node.add(f"Level: [blue]{triage_res.triage_result.level.value}[/]")
+                data_node = rule_node.add("[dim]Extracted Data[/]")
+                if triage_res.triage_result.extraction_raw:
+                    for k, v in triage_res.triage_result.extraction_raw.items():
+                        if isinstance(v, dict):
+                            sub = data_node.add(f"[cyan]{k}[/]")
+                            for sk, sv in v.items(): sub.add(f"{sk}: {sv}")
+                        else:
+                            data_node.add(f"{k}: {v}")
+            else:
+                rule_node.add(f"❌ Extraction Failed", style="red")
+                if triage_res.extraction_error:
+                    rule_node.add(f"[dim red]{triage_res.extraction_error}[/]")
 
-## Tone Examples
+            # Validation Branch
+            val_icon = self._get_action_icon(val_res.validation_action)
+            val_node = spec_tree.add(f"🧠 [bold]LLM Validator[/]")
+            action_style = "yellow" if val_res.validation_action == ValidationAction.ASSIGN else "green"
+            val_node.add(f"Action: [{action_style}]{val_res.validation_action.value.upper()} {val_icon}[/]")
+            if val_res.extraction_status != ExtractionStatus.VALID:
+                val_node.add(f"Status: [orange1]{val_res.extraction_status.value}[/]")
+            val_node.add(f"Final: [underline]{val_res.validated_level.value}[/]")
 
-**URGENT - Reassuring but Clear:**
-"Your baby needs to be seen by a doctor right away. This doesn't mean something is definitely wrong, but babies under 3 months with fever need immediate medical evaluation to make sure there's no serious infection. The medical team will examine your baby and may do some tests to keep them safe."
+            border_col = "green"
+            if val_res.validation_action in [ValidationAction.ASSIGN]: border_col = "yellow"
+            
+            panels.append(Panel(spec_tree, border_style=border_col, width=40))
 
-**MODERATE - Balanced:**
-"Your child should be seen by a doctor today. The fever has lasted several days, and while your child doesn't have signs of serious illness right now, we want to make sure nothing more serious is developing. The doctor will examine your child and decide if any tests or treatment are needed."
+        self.console.print(Panel(Columns(panels), title="Step 3: Parallel Specialty Agents", border_style="blue", box=ROUNDED))
 
-**MILD - Reassuring:**
-"Your child can be seen when convenient, usually within the next day or two. The symptoms you've described are common and don't require emergency care. We'll provide you with instructions for managing symptoms at home and signs to watch for that would need immediate attention."
+    def render_aggregation(self, final: FinalTriageDecision):
+        bar = Progress(TextColumn("[bold blue]Clinical Coherence"), BarColumn(), TextColumn("[bold magenta]{task.percentage:.0f}%"))
+        task = bar.add_task("score", total=100)
+        bar.update(task, completed=final.clinical_coherence_score * 100)
 
-## Example
+        grid = Table.grid(expand=True, padding=(1, 2))
+        grid.add_column(ratio=2)
+        grid.add_column(ratio=1)
 
-Summary: "Your 2-month-old baby needs to be seen by a doctor right away."
+        level_style = self._get_level_style(final.final_level)
+        left_content = Text()
+        left_content.append(f"FINAL DECISION: {final.final_level.value.upper()}\n", style=level_style)
+        left_content.append(f"\nReasoning: {final.rationale_summary}")
+        if final.conflict_resolution_notes:
+             left_content.append(f"\n\nConflicts Resolved: {final.conflict_resolution_notes}", style="italic cyan")
 
-Detailed: "Your baby has a fever of 39°C (102.2°F). In babies this young, any fever is taken very seriously because their immune systems are still developing, and they can become sick very quickly. This doesn't mean your baby definitely has a serious infection, but doctors need to check right away to be safe. Young babies with fever need careful evaluation and sometimes tests to make sure there's no infection that needs treatment."
+        right_content = Text()
+        right_content.append("Requires Review: ")
+        right_content.append(f"{final.requires_human_review}\n", style="red" if final.requires_human_review else "green")
+        if final.review_triggers:
+            right_content.append("Triggers:\n", style="dim underline")
+            for t in final.review_triggers: right_content.append(f"- {t}\n", style="dim red")
 
-Key Findings:
-- Your baby is 2 months old
-- They have a fever (39°C/102.2°F)
-- The fever started about 6 hours ago
-- You haven't noticed other concerning symptoms like rash or extreme sleepiness
+        grid.add_row(left_content, right_content)
+        
+        self.console.print(Panel(bar, title="Step 4: Clinical Coherence", border_style="magenta", box=ROUNDED))
+        self.console.print(Panel(grid, title="🏁 FINAL AGGREGATION", border_style=self._get_level_style(final.final_level).split()[-1], box=HEAVY))
 
-Next Steps: "A doctor will examine your baby soon. They may want to do some tests like blood work or urine tests to check for infection. These tests help make sure your baby is safe. The medical team will explain everything they're doing and answer your questions. Your baby will be closely monitored while you're here."
+    def render_all(self, patient, safety, routing, specialties, triage):
+        self.console.rule("[bold blue]MULTI-AGENT TRIAGE TRACE[/]")
+        self.render_header(patient)
+        self.render_safety(safety)
+        if not safety.requires_immediate_escalation:
+            self.render_routing(routing)
+            self.render_specialty_swimlanes(specialties)
+            self.render_aggregation(triage)
+        self.console.rule("[bold blue]END TRACE[/]")
 
-Warnings:
-- If your baby becomes very sleepy or difficult to wake, tell the medical team immediately
-- If you notice a rash that doesn't fade when pressed, alert the staff right away
-- If your baby refuses to eat or has trouble breathing, these are important signs to report
-"""
-
-
-# ============================================================================
-# Explainer Agent
-# ============================================================================
 
 class TriageExplainer:
     """
-    Generates human-readable explanations of triage decisions
-    tailored to different audiences.
+    Generates human-readable explanations of triage decisions 
+    and high-fidelity visual debugging traces.
     """
     
-    def __init__(self, hf_model: OutlinesModel):
-        """
-        Initialize explainer with AI model.
-        
-        Args:
-            hf_model: OutlinesModel for generating explanations
-        """
-        # Medical staff explainer
+    def __init__(self, out_model: OutlinesModel):
+        # ... your existing init for medical_explainer and patient_explainer ...
         self.medical_explainer = Agent(
-            model=hf_model,
-            output_type=TriageExplanation,
+            model=out_model,
             system_prompt=EXPLAINER_MEDICAL_STAFF_PROMPT,
-            retries=2,
         )
-        
-        # Patient/family explainer
+
         self.patient_explainer = Agent(
-            model=hf_model,
-            output_type=TriageExplanation,
+            model=out_model,
             system_prompt=EXPLAINER_PATIENT_FAMILY_PROMPT,
-            retries=2,
+        )
+        # Initialize the visualizer for debugging
+        self.viz = TriageVisualizer()
+
+    async def explain_for_debugging(
+        self,
+        patient_ctx: PatientContext,
+        safety_assessment: SafetyAssessment,
+        final_decision: FinalTriageDecision,
+        routing_decision: Optional[RoutingDecision] = None,
+        specialty_results: Optional[Dict[SpecialtyType, Dict[str, Any]]] = None,
+    ) -> str:
+        """
+        Renders a beautiful terminal dashboard and returns the raw 
+        string for logging purposes.
+        """
+        # 1. TRIGGER THE VISUAL DASHBOARD
+        # We wrap this in a try-block to ensure debugging never crashes the main flow
+        try:
+            self.viz.render_all(
+                patient=patient_ctx,
+                safety=safety_assessment,
+                routing=routing_decision,
+                specialties=specialty_results,
+                triage=final_decision
+            )
+        except Exception as e:
+            print(f"Visualization Error: {e}")
+
+        # 2. RETURN THE RAW STRING (For file logs/backups)
+        return self._build_explanation_prompt(
+            patient_ctx, final_decision,
+            safety_assessment, routing_decision, specialty_results
         )
     
+
     async def explain(
         self,
         patient_ctx: PatientContext,
         final_decision: FinalTriageDecision,
-        validated_specialties: Optional[List[SpecialtyValidation]] = None, 
+        audience: AudienceType,
         safety_assessment: Optional[SafetyAssessment] = None,
         routing_decision: Optional[RoutingDecision] = None,
-        specialty_results: Optional[Dict[SpecialtyType, SpecialtyTriageResult]] = None,
-        audience: AudienceType = AudienceType.MEDICAL_STAFF
-    ) -> TriageExplanation:
+        specialty_results: Optional[Dict[SpecialtyType, Dict[str, Any]]] = None
+    ) -> str:
         """
         Generate explanation of triage decision for specified audience.
-        
+       
         Args:
             patient_ctx: Original patient context
             final_decision: Final triage decision from aggregator
-            safety_assessment: Optional safety check results
             routing_decision: Optional routing results
-            specialty_results: Optional individual specialty results
+            specialty_results: Optional individual specialty results (extraction, rb triage and validation)
             audience: Target audience for explanation
-        
+       
         Returns:
             TriageExplanation tailored to the audience
         """
         # Select appropriate agent
         agent = (
-            self.medical_explainer 
-            if audience == AudienceType.MEDICAL_STAFF 
+            self.medical_explainer
+            if audience == AudienceType.MEDICAL_STAFF
             else self.patient_explainer
         )
-        
+       
         # Build comprehensive prompt
         prompt = self._build_explanation_prompt(
-            patient_ctx,
-            final_decision,
-            validated_specialties,
-            safety_assessment,
-            routing_decision,
-            specialty_results
+            patient_ctx, final_decision,
+            safety_assessment, routing_decision, specialty_results
         )
-        
+    
+       
         # Generate explanation
         result = await agent.run(
             prompt,
             model_settings=ModelSettings(extra_body={'max_new_tokens': 800})
         )
-        
+       
         return result.output
-    
+   
     def _build_explanation_prompt(
         self,
         patient_ctx: PatientContext,
         final_decision: FinalTriageDecision,
-        validated_specialties: Optional[List[SpecialtyValidation]],
         safety_assessment: Optional[SafetyAssessment],
         routing_decision: Optional[RoutingDecision],
-        specialty_results: Optional[Dict[SpecialtyType, SpecialtyTriageResult]]
+        specialty_results: Optional[Dict[SpecialtyType, Dict[str, Any]]]
     ) -> str:
         """Build comprehensive prompt for explanation generation."""
         prompt_parts = [
@@ -299,80 +330,33 @@ class TriageExplainer:
             "\n### PATIENT CASE",
             patient_ctx._patient_summary,
         ]
-        
+       
         # Add safety assessment if available
         if safety_assessment:
             prompt_parts.append("\n### SAFETY ASSESSMENT")
             prompt_parts.append(safety_assessment.format_for_explanation())
-        
+       
         # Add routing if available
         if routing_decision:
             prompt_parts.append("\n### ROUTING")
             prompt_parts.append(routing_decision.format_for_explanation())
-        
-        # Add specialty results if available
+       
+
         if specialty_results:
             prompt_parts.append("\n### SPECIALTY EVALUATIONS")
-            for specialty, result in specialty_results.items():
-                if result.extraction_success:
-                    prompt_parts.append(f"\n{result.format_for_explanation()}")
-        
-        if validated_specialties:
-            prompt_parts.append("\n### VALIDATED SPECIALTIES")
-            for validation in validated_specialties:
-                prompt_parts.append(f"\n{validation.format_for_explanation()}")
-
-        
+            for specialty, specialty_result in specialty_results.items():
+                prompt_parts.append(f"{specialty.value} extraction and triage:")
+                prompt_parts.append(specialty_result['triage'].format_for_explanation())
+                prompt_parts.append(specialty_result['validation'].format_for_explanation())
+       
         # Add final decision (always present)
         prompt_parts.append("\n### FINAL DECISION")
         prompt_parts.append(final_decision.format_for_explanation())
-        
+       
         prompt_parts.append("\n### TASK")
         prompt_parts.append(
             "Based on all the information above, generate a clear, "
             "comprehensive explanation of the triage decision."
         )
-        
+       
         return "\n".join(prompt_parts)
-    
-    async def explain_for_debugging(
-        self,
-        patient_ctx: PatientContext,
-        final_decision: FinalTriageDecision,
-        validated_specialties: Optional[List[SpecialtyValidation]] = None,
-        safety_assessment: Optional[SafetyAssessment] = None,
-        routing_decision: Optional[RoutingDecision] = None,
-        specialty_results: Optional[Dict[SpecialtyType, SpecialtyTriageResult]] = None,
-    ) -> str:
-        """
-        Generate detailed debugging output showing full pipeline execution.
-        
-        Returns raw formatted text, not an explanation.
-        """
-        debug_parts = [
-            "=" * 70,
-            "TRIAGE PIPELINE DEBUG OUTPUT",
-            "=" * 70,
-            f"\n### PATIENT CONTEXT",
-            patient_ctx._patient_summary,
-        ]
-        
-        if safety_assessment:
-            debug_parts.append(f"\n{safety_assessment.format_for_explanation()}")
-        
-        if routing_decision:
-            debug_parts.append(f"\n{routing_decision.format_for_explanation()}")
-        
-        if specialty_results:
-            debug_parts.append("\n### SPECIALTY RESULTS")
-            for specialty, result in specialty_results.items():
-                debug_parts.append(f"\n{result.format_for_explanation()}")
-                
-        if validated_specialties:
-            debug_parts.append("\n### VALIDATED SPECIALTIES")
-            for validation in validated_specialties:
-                debug_parts.append(f"\n{validation.format_for_explanation()}")
-        
-        debug_parts.append(f"\n{final_decision.format_for_explanation()}")
-        
-        return "\n".join(debug_parts)
